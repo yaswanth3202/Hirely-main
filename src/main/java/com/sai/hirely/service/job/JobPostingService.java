@@ -1,0 +1,167 @@
+package com.sai.hirely.service.job;
+
+import com.sai.hirely.dto.job.JobCard;
+import com.sai.hirely.dto.job.JobFilterRequest;
+import com.sai.hirely.dto.job.JobPostingRequest;
+import com.sai.hirely.dto.skill.job.JobCreateSkill;
+import com.sai.hirely.dto.skill.job.JobExistingSkill;
+import com.sai.hirely.models.job.JobPosting;
+import com.sai.hirely.models.job.JobSkillRequirement;
+import com.sai.hirely.models.utils.Skill;
+import com.sai.hirely.repository.company.CompanyRepo;
+import com.sai.hirely.repository.company.HiringManagerRepo;
+import com.sai.hirely.repository.job.JobPostingRepo;
+import com.sai.hirely.repository.role.RoleRepo;
+import com.sai.hirely.repository.skill.JobSkillRequirementRepo;
+import com.sai.hirely.repository.skill.SkillRepo;
+import com.sai.hirely.repository.specifications.jobPosting.JobCriteriaApiRepo;
+import com.sai.hirely.service.skill.SkillService;
+import com.sai.hirely.exceptions.company.EntityNotFoundException;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.Pageable;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+import jakarta.persistence.EntityManager;
+
+import java.util.ArrayList;
+import java.util.List;
+
+@Service
+public class JobPostingService {
+    private final JobSkillRequirementRepo jobSkillRequirementRepo;
+    private final JobPostingRepo postingRepo;
+    private final SkillService skillService;
+    private final CompanyRepo companyRepo;
+    private final HiringManagerRepo hrRepo;
+    private final SkillRepo skillRepo;
+    private final RoleRepo roleRepo;
+    private final EntityManager entityManager;
+    private final JobCriteriaApiRepo jobCaRepo;
+    private final com.sai.hirely.service.email.EmailService emailService;
+    private final com.sai.hirely.repository.candidate.CandidateInterestsRepo candidateInterestsRepo;
+    private final com.sai.hirely.repository.candidate.CandidateRepo candidateRepo;
+
+    public JobPostingService(JobPostingRepo postingRepo, JobCriteriaApiRepo jobCaRepo, SkillService skillService, CompanyRepo companyRepo, HiringManagerRepo hrRepo, JobSkillRequirementRepo jobSkillRequirementRepo, SkillRepo skillRepo, RoleRepo roleRepo, EntityManager entityManager, com.sai.hirely.service.email.EmailService emailService, com.sai.hirely.repository.candidate.CandidateInterestsRepo candidateInterestsRepo, com.sai.hirely.repository.candidate.CandidateRepo candidateRepo) {
+        this.postingRepo = postingRepo;
+        this.skillService = skillService;
+        this.companyRepo = companyRepo;
+        this.hrRepo = hrRepo;
+        this.jobSkillRequirementRepo = jobSkillRequirementRepo;
+        this.skillRepo = skillRepo;
+        this.roleRepo = roleRepo;
+        this.entityManager = entityManager;
+        this.jobCaRepo = jobCaRepo;
+        this.emailService = emailService;
+        this.candidateInterestsRepo = candidateInterestsRepo;
+        this.candidateRepo = candidateRepo;
+    }
+    @Transactional
+    public JobPosting createJobPosting(JobPostingRequest request) {
+        return createJobPosting(request, request.companyId(), request.hiringManagerId());
+    }
+
+    @Transactional
+    public JobPosting createJobPosting(JobPostingRequest request, Long companyId, Long hiringManagerId) {
+        List<JobCreateSkill> createSkills = request.createSkills();
+        List<JobExistingSkill> existingSkills = request.existingSkills();
+
+        List<JobSkillRequirement> skillRequirements = new ArrayList<>();
+        JobPosting posting = postingRepo.save(getJobPosting(request, companyId, hiringManagerId));
+        if(createSkills!=null) {
+            List<Skill> skills =
+                    skillService.createSkills(createSkills);
+            for (int i = 0; i < skills.size(); i++) {
+                skillRequirements.add( new JobSkillRequirement(
+                        posting,
+                        skills.get(i),
+                        createSkills.get(i).getProficiency(),
+                        createSkills.get(i).isRequired()
+                ));
+            }
+        }
+        if(existingSkills!=null) {
+            for (JobExistingSkill existingSKill : request.existingSkills()) {
+                skillRequirements.add(new JobSkillRequirement(
+                        posting,
+                        skillRepo.getReferenceById(existingSKill.getId()),
+                        existingSKill.getProficiency(),
+                        existingSKill.isRequired()
+                ));
+            }
+        }
+        jobSkillRequirementRepo.saveAll(skillRequirements);
+        entityManager.flush();
+        entityManager.clear();
+
+        JobPosting fullPosting = findFullJobDetails(posting.getId());
+
+        // Notify candidates with matching role interests
+        if (fullPosting.getRole() != null) {
+            List<com.sai.hirely.models.candidate.CandidateInterests> interests = 
+                    candidateInterestsRepo.findByIdRoleId(fullPosting.getRole().getId());
+            for (com.sai.hirely.models.candidate.CandidateInterests interest : interests) {
+                candidateRepo.findById(interest.getId().getCandidateId()).ifPresent(candidate -> {
+                    emailService.sendJobPostedEmail(candidate.getEmail(), candidate.getFirstName(), fullPosting);
+                });
+            }
+        }
+
+        return fullPosting;
+    }
+
+    public JobPosting getJobPosting(JobPostingRequest request, Long companyId, Long hiringManagerId) {
+        JobPosting posting = new JobPosting();
+        posting.setCompany(companyRepo.getReferenceById(companyId));
+        if (hiringManagerId != null) {
+            posting.setHiringManager(hrRepo.getReferenceById(hiringManagerId));
+        }
+        posting.setDescription(request.description());
+        posting.setMinimumExperienceInMonths(request.minimumExperienceInMonths());
+        posting.setTitle(request.title());
+        posting.setSalaryLower(request.salaryLower());
+        posting.setSalaryHigher(request.salaryHigher());
+        posting.setStatus(request.status());
+        posting.setPostedAt(request.postedAt());
+        posting.setExpiresAt(request.expiresAt());
+        posting.setLocation(request.location());
+        if (request.createRoleName() != null && !request.createRoleName().isBlank()) {
+            com.sai.hirely.models.utils.RoleEntity newRole = roleRepo.findByName(request.createRoleName().trim());
+            if (newRole == null) {
+                newRole = roleRepo.save(new com.sai.hirely.models.utils.RoleEntity(request.createRoleName().trim()));
+            }
+            posting.setRole(newRole);
+        } else if (request.roleId() != null) {
+            posting.setRole(roleRepo.getReferenceById(request.roleId()));
+        }
+        posting.setWorkMode(request.workMode());
+        posting.setWorkingHoursPerDay(request.workingHoursPerDay());
+        posting.setType(request.type());
+        return posting;
+    }
+
+    public JobPosting findFullJobDetails(Long jobId) {
+        return postingRepo.findWholeObjectGraphById(jobId).orElseThrow(() -> new EntityNotFoundException("JobPosting", jobId));
+    }
+
+    public Page<JobCard> getPage(JobFilterRequest filterRequest, Pageable pageable) {
+        return jobCaRepo.getJobCards(pageable,filterRequest);
+    }
+
+    @Transactional(readOnly = true)
+    public List<JobPosting> findByCompanyId(Long companyId) {
+        return postingRepo.findWholeObjectGraphByCompanyId(companyId);
+    }
+
+    @Transactional(readOnly = true)
+    public List<JobPosting> findByHiringManagerId(Long hiringManagerId) {
+        return postingRepo.findWholeObjectGraphByHiringManagerId(hiringManagerId);
+    }
+
+    @Transactional
+    public void deleteJobPosting(Long id) throws EntityNotFoundException {
+        if (!postingRepo.existsById(id)) {
+            throw new EntityNotFoundException("JobPosting", id);
+        }
+        postingRepo.deleteById(id);
+    }
+}
